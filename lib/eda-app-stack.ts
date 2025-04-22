@@ -17,226 +17,170 @@ export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // S3 Bucket for storing images
-    const imagesBucket = new s3.Bucket(this, "images", {
+    // 1. S3 Bucket for storing images
+    const imagesBucket = new s3.Bucket(this, "ImagesBucket", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
-      publicReadAccess: false,
     });
 
-    // DynamoDB table for images metadata
+    // 2. DynamoDB table for images metadata
     const imagesTable = new dynamodb.Table(this, "ImagesTable", {
       partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Integration infrastructure - SNS Topic
-    const newImageTopic = new sns.Topic(this, "NewImageTopic", {
-      displayName: "New Image topic",
-    }); 
+    // 3. SNS Topic
+    const newImageTopic = new sns.Topic(this, "NewImageTopic");
 
-    // Dead Letter Queue for invalid images
-    const imagesDLQ = new sqs.Queue(this, "images-dlq", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
+    // 4. SQS Queues
+    const imagesDLQ = new sqs.Queue(this, "ImagesDLQ");
+    const imageProcessQueue = new sqs.Queue(this, "ImageProcessQueue", {
+      deadLetterQueue: { queue: imagesDLQ, maxReceiveCount: 3 },
+      visibilityTimeout: cdk.Duration.seconds(30),
     });
+    const metadataUpdateQueue = new sqs.Queue(this, "MetadataUpdateQueue");
+    const statusUpdateQueue = new sqs.Queue(this, "StatusUpdateQueue");
+    const mailerQueue = new sqs.Queue(this, "MailerQueue");
 
-    // Main queue for processing valid images with DLQ
-    const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-      deadLetterQueue: {
-        queue: imagesDLQ,
-        maxReceiveCount: 3
-      }
-    });
-
-    // Queue for metadata updates
-    const metadataUpdateQueue = new sqs.Queue(this, "metadata-update-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-    });
-
-    // Queue for status updates
-    const statusUpdateQueue = new sqs.Queue(this, "status-update-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-    });
-
-    // Queue for confirmation emails
-    const mailerQueue = new sqs.Queue(this, "mailer-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-    });
-
-    // Lambda functions
-
-    // 1. Log Image Lambda - validates image type and logs to DynamoDB
+    // 5. Lambda functions
     const logImageFn = new lambdanode.NodejsFunction(this, "LogImageFn", {
       runtime: lambda.Runtime.NODEJS_22_X,
       entry: `${__dirname}/../lambdas/logImage.ts`,
-      timeout: cdk.Duration.seconds(15),
-      memorySize: 128,
-      environment: {
-        IMAGES_TABLE: imagesTable.tableName,
+      handler: "handler",
+      environment: { 
+        IMAGES_TABLE: imagesTable.tableName 
       },
+      timeout: cdk.Duration.seconds(15),
     });
 
-    // 2. Add Metadata Lambda - updates image metadata
     const addMetadataFn = new lambdanode.NodejsFunction(this, "AddMetadataFn", {
       runtime: lambda.Runtime.NODEJS_22_X,
       entry: `${__dirname}/../lambdas/addMetadata.ts`,
-      timeout: cdk.Duration.seconds(15),
-      memorySize: 128,
-      environment: {
-        IMAGES_TABLE: imagesTable.tableName,
+      handler: "handler",
+      environment: { 
+        IMAGES_TABLE: imagesTable.tableName 
       },
+      timeout: cdk.Duration.seconds(15),
     });
 
-    // 3. Update Status Lambda - updates review status
     const updateStatusFn = new lambdanode.NodejsFunction(this, "UpdateStatusFn", {
       runtime: lambda.Runtime.NODEJS_22_X,
       entry: `${__dirname}/../lambdas/updateStatus.ts`,
-      timeout: cdk.Duration.seconds(15),
-      memorySize: 128,
-      environment: {
-        IMAGES_TABLE: imagesTable.tableName,
-        MAILER_QUEUE_URL: mailerQueue.queueUrl
+      handler: "handler",
+      environment: { 
+        IMAGES_TABLE: imagesTable.tableName
       },
+      timeout: cdk.Duration.seconds(15),
     });
 
-    // 4. Remove Image Lambda - removes invalid images from DLQ
     const removeImageFn = new lambdanode.NodejsFunction(this, "RemoveImageFn", {
       runtime: lambda.Runtime.NODEJS_22_X,
       entry: `${__dirname}/../lambdas/removeImage.ts`,
+      handler: "handler",
       timeout: cdk.Duration.seconds(15),
-      memorySize: 128,
     });
 
-    // 5. Confirmation Mailer Lambda - sends status update emails
     const confirmationMailerFn = new lambdanode.NodejsFunction(this, "ConfirmationMailerFn", {
       runtime: lambda.Runtime.NODEJS_22_X,
-      memorySize: 1024,
-      timeout: cdk.Duration.seconds(15),
       entry: `${__dirname}/../lambdas/confirmationMailer.ts`,
+      handler: "handler",
       environment: {
         IMAGES_TABLE: imagesTable.tableName,
+        SES_EMAIL_FROM: "no-reply@yourdomain.com", // <- 设置你的发件地址
+        SES_REGION: this.region,
       },
+      timeout: cdk.Duration.seconds(15),
     });
 
-    // Event Sources
-
-    // S3 -> SNS (image uploads trigger SNS)
+    // 6. S3 -> SNS
     imagesBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SNS -> SQS subscriptions with filters
-    
-    // 1. Filter for image processing (only jpg/png)
+    // 7. SNS -> SQS Subscriptions (Fan-out + 过滤)
+    //  7.1 所有新对象都给 LogImage
     newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue, {
-        filterPolicy: {
-          "eventName": sns.SubscriptionFilter.stringFilter({
-            allowlist: ["ObjectCreated:Put", "ObjectCreated:Post"]
-          })
-        }
-      })
+      new subs.SqsSubscription(imageProcessQueue)
     );
 
-    // 2. Filter for metadata updates
+    //  7.2 元数据更新消息
     newImageTopic.addSubscription(
       new subs.SqsSubscription(metadataUpdateQueue, {
         filterPolicy: {
-          "metadata_type": sns.SubscriptionFilter.stringFilter({
-            allowlist: ["Caption", "Date", "name"]
-          })
-        }
+          metadata_type: sns.SubscriptionFilter.existsFilter(),
+        },
       })
     );
 
-    // 3. Filter for status updates
+    //  7.3 状态更新消息
+    const statusFilter = {
+      messageType: sns.SubscriptionFilter.stringFilter({
+        allowlist: ["StatusUpdate"],
+      }),
+    };
     newImageTopic.addSubscription(
       new subs.SqsSubscription(statusUpdateQueue, {
-        filterPolicy: {
-          "status": sns.SubscriptionFilter.existsFilter()
-        }
+        filterPolicy: statusFilter,
+      })
+    );
+    
+    //  7.4 同样把状态更新推给邮件队列
+    newImageTopic.addSubscription(
+      new subs.SqsSubscription(mailerQueue, { 
+        filterPolicy: statusFilter 
       })
     );
 
-    // SQS -> Lambda event sources
+    // 8. SQS -> Lambda Event Sources
+    logImageFn.addEventSource(
+      new events.SqsEventSource(imageProcessQueue, { batchSize: 5 })
+    );
     
-    // 1. Log Image Lambda
-    const newImageEventSource = new events.SqsEventSource(imageProcessQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    logImageFn.addEventSource(newImageEventSource);
+    addMetadataFn.addEventSource(
+      new events.SqsEventSource(metadataUpdateQueue, { batchSize: 5 })
+    );
+    
+    updateStatusFn.addEventSource(
+      new events.SqsEventSource(statusUpdateQueue, { batchSize: 5 })
+    );
+    
+    confirmationMailerFn.addEventSource(
+      new events.SqsEventSource(mailerQueue, { batchSize: 5 })
+    );
+    
+    removeImageFn.addEventSource(
+      new events.SqsEventSource(imagesDLQ, { batchSize: 5 })
+    );
 
-    // 2. Add Metadata Lambda
-    const metadataEventSource = new events.SqsEventSource(metadataUpdateQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    addMetadataFn.addEventSource(metadataEventSource);
-
-    // 3. Update Status Lambda
-    const statusEventSource = new events.SqsEventSource(statusUpdateQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    updateStatusFn.addEventSource(statusEventSource);
-
-    // 4. Remove Image Lambda (processes DLQ messages)
-    const dlqEventSource = new events.SqsEventSource(imagesDLQ, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    removeImageFn.addEventSource(dlqEventSource);
-
-    // 5. Confirmation Mailer Lambda
-    const mailerEventSource = new events.SqsEventSource(mailerQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    confirmationMailerFn.addEventSource(mailerEventSource);
-
-    // Permissions
-
-    // S3 permissions
+    // 9. Permissions
     imagesBucket.grantRead(logImageFn);
     imagesBucket.grantDelete(removeImageFn);
 
-    // DynamoDB permissions
     imagesTable.grantWriteData(logImageFn);
     imagesTable.grantReadWriteData(addMetadataFn);
     imagesTable.grantReadWriteData(updateStatusFn);
     imagesTable.grantReadData(confirmationMailerFn);
 
-    // SQS permissions
-    mailerQueue.grantSendMessages(updateStatusFn);
-
-    // SES permissions for email sending
+    // SES permissions
     confirmationMailerFn.addToRolePolicy(
       new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "ses:SendEmail",
-          "ses:SendRawEmail",
-          "ses:SendTemplatedEmail",
-        ],
+        actions: ["ses:SendEmail", "ses:SendRawEmail"],
         resources: ["*"],
       })
     );
 
     // Output
-    
-    new cdk.CfnOutput(this, "bucketName", {
+    new cdk.CfnOutput(this, "BucketName", {
       value: imagesBucket.bucketName,
     });
-
-    new cdk.CfnOutput(this, "tableName", {
+    
+    new cdk.CfnOutput(this, "TableName", {
       value: imagesTable.tableName,
     });
-
-    new cdk.CfnOutput(this, "topicArn", {
+    
+    new cdk.CfnOutput(this, "TopicArn", {
       value: newImageTopic.topicArn,
     });
   }
