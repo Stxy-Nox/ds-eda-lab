@@ -1,106 +1,47 @@
 import { SQSHandler } from "aws-lambda";
 import {
   DynamoDBClient,
-  UpdateItemCommand,
-  UpdateItemCommandInput,
   GetItemCommand,
-  GetItemCommandInput,
+  UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
-import {
-  SQSClient,
-  SendMessageCommand,
-  SendMessageCommandInput,
-} from "@aws-sdk/client-sqs";
 
-const dynamodb = new DynamoDBClient();
-const sqs = new SQSClient();
-const imagesTable = process.env.IMAGES_TABLE;
-const mailerQueueUrl = process.env.MAILER_QUEUE_URL;
-
-// Valid statuses
-const VALID_STATUSES = ["Pass", "Reject"];
+const dynamodb = new DynamoDBClient({});
+const imagesTable = process.env.IMAGES_TABLE!;
+const VALID_STATUS = ["Pass", "Reject"];
 
 export const handler: SQSHandler = async (event) => {
-  console.log("Event ", JSON.stringify(event));
+  for (const rec of event.Records) {
+    const body = JSON.parse(rec.body);
+    const snsMsg = JSON.parse(body.Message);
+    const { id, date, update } = snsMsg;
+    if (!id || !date || !update?.status || !update?.reason) continue;
+    if (!VALID_STATUS.includes(update.status)) continue;
 
-  for (const record of event.Records) {
-    const recordBody = JSON.parse(record.body);
-    const snsMessage = JSON.parse(recordBody.Message);
+    // 确保存在
+    const got = await dynamodb.send(
+      new GetItemCommand({
+        TableName: imagesTable,
+        Key: { id: { S: id } },
+      })
+    );
+    if (!got.Item) continue;
 
-    try {
-      // Parse message body to get image ID, date and status update
-      const { id, date, update } = snsMessage;
-      
-      if (!id || !date || !update || !update.status || !update.reason) {
-        console.error("Invalid message format - missing required fields");
-        continue;
-      }
-      
-      const { status, reason } = update;
-      
-      // Validate status
-      if (!VALID_STATUSES.includes(status)) {
-        console.error(`Invalid status value: ${status}`);
-        continue;
-      }
-      
-      // First check if image exists
-      const getParams: GetItemCommandInput = {
+    // 写状态 & 理由 & 审核日
+    await dynamodb.send(
+      new UpdateItemCommand({
         TableName: imagesTable,
-        Key: {
-          id: { S: id },
-        },
-      };
-      
-      const getResult = await dynamodb.send(new GetItemCommand(getParams));
-      
-      if (!getResult.Item) {
-        console.error(`Image does not exist: ${id}`);
-        continue;
-      }
-      
-      // Get photographer name for notification
-      const photographerName = getResult.Item.name?.S || "Unknown Photographer";
-      
-      // Update status and reason
-      const updateParams: UpdateItemCommandInput = {
-        TableName: imagesTable,
-        Key: {
-          id: { S: id },
-        },
-        UpdateExpression: "SET #status = :status, reason = :reason, reviewDate = :date",
-        ExpressionAttributeNames: {
-          "#status": "status", // Avoid reserved word conflict
-        },
+        Key: { id: { S: id } },
+        UpdateExpression:
+          "SET #st = :s, reason = :r, reviewDate = :d",
+        ExpressionAttributeNames: { "#st": "status" },
         ExpressionAttributeValues: {
-          ":status": { S: status },
-          ":reason": { S: reason },
-          ":date": { S: date },
+          ":s": { S: update.status },
+          ":r": { S: update.reason },
+          ":d": { S: date },
         },
-      };
-      
-      await dynamodb.send(new UpdateItemCommand(updateParams));
-      console.log(`Updated image ${id} status: ${status}, reason: ${reason}`);
-      
-      // Send notification message to mailer queue
-      const messageBody = {
-        imageId: id,
-        photographerName,
-        status,
-        reason,
-        reviewDate: date,
-      };
-      
-      const sendParams: SendMessageCommandInput = {
-        QueueUrl: mailerQueueUrl,
-        MessageBody: JSON.stringify(messageBody),
-      };
-      
-      await sqs.send(new SendMessageCommand(sendParams));
-      console.log(`Sent status update notification to mailer queue: ${id}`);
-      
-    } catch (error) {
-      console.error("Error processing status update:", error);
-    }
+      })
+    );
+    console.log(`Status updated for ${id}: ${update.status}`);
+    // NOTE: 不再手动发 SQS，依赖 SNS Fan-out 到 mailerQueue
   }
 }; 
