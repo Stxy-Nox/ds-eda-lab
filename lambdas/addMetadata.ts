@@ -1,75 +1,43 @@
 import { SQSHandler } from "aws-lambda";
 import {
   DynamoDBClient,
-  UpdateItemCommand,
-  UpdateItemCommandInput,
   GetItemCommand,
-  GetItemCommandInput,
+  UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 
-const dynamodb = new DynamoDBClient();
-const imagesTable = process.env.IMAGES_TABLE;
-
-// Valid metadata types
-const VALID_METADATA_TYPES = ["Caption", "Date", "name"];
+const dynamodb = new DynamoDBClient({});
+const imagesTable = process.env.IMAGES_TABLE!;
+const VALID = ["Caption", "Date", "name"];
 
 export const handler: SQSHandler = async (event) => {
-  console.log("Event ", JSON.stringify(event));
+  for (const rec of event.Records) {
+    const body = JSON.parse(rec.body);
+    const attrs = body.MessageAttributes || {};
+    const metaType = attrs.metadata_type?.Value;
+    if (!metaType || !VALID.includes(metaType)) continue;
 
-  for (const record of event.Records) {
-    const recordBody = JSON.parse(record.body);
-    const snsMessage = JSON.parse(recordBody.Message);
-    
-    // Get metadata type from message attributes
-    const messageAttributes = recordBody.MessageAttributes || {};
-    const metadataType = messageAttributes.metadata_type?.StringValue;
-    
-    if (!metadataType || !VALID_METADATA_TYPES.includes(metadataType)) {
-      console.error(`Invalid metadata type: ${metadataType}`);
-      continue; // Skip invalid metadata type
-    }
-    
-    try {
-      // Parse message body to get image ID and metadata value
-      const { id, value } = snsMessage;
-      
-      if (!id || !value) {
-        console.error("Invalid message format - missing id or value");
-        continue;
-      }
-      
-      // First check if image exists
-      const getParams: GetItemCommandInput = {
+    const msg = JSON.parse(body.Message);
+    const { id, value } = msg;
+    if (!id || !value) continue;
+
+    // 确保存在
+    const got = await dynamodb.send(
+      new GetItemCommand({
         TableName: imagesTable,
-        Key: {
-          id: { S: id },
-        },
-      };
-      
-      const getResult = await dynamodb.send(new GetItemCommand(getParams));
-      
-      if (!getResult.Item) {
-        console.error(`Image does not exist: ${id}`);
-        continue;
-      }
-      
-      // Update metadata
-      const updateParams: UpdateItemCommandInput = {
+        Key: { id: { S: id } },
+      })
+    );
+    if (!got.Item) continue;
+
+    // 更新
+    await dynamodb.send(
+      new UpdateItemCommand({
         TableName: imagesTable,
-        Key: {
-          id: { S: id },
-        },
-        UpdateExpression: `SET ${metadataType.toLowerCase()} = :value`,
-        ExpressionAttributeValues: {
-          ":value": { S: value },
-        },
-      };
-      
-      await dynamodb.send(new UpdateItemCommand(updateParams));
-      console.log(`Updated ${metadataType} for image ${id}: ${value}`);
-      
-    } catch (error) {
-      console.error("Error processing metadata update:", error);
-    }
+        Key: { id: { S: id } },
+        UpdateExpression: `SET ${metaType.toLowerCase()} = :v`,
+        ExpressionAttributeValues: { ":v": { S: value } },
+      })
+    );
+    console.log(`Updated ${id} ${metaType}`);
   }
 }; 
