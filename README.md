@@ -89,7 +89,17 @@ Valid metadata types: `Caption`, `Date`, `name`
 Use AWS CLI to send SNS messages:
 
 ```bash
-aws sns publish --topic-arn "your-topic-arn" --message file://status.json
+aws sns publish --topic-arn "your-topic-arn" --message-attributes file://message-attr.json --message file://status.json
+```
+
+`message-attr.json` example:
+```json
+{
+  "messageType": {
+    "DataType": "String",
+    "StringValue": "StatusUpdate"
+  }
+}
 ```
 
 `status.json` example:
@@ -112,7 +122,7 @@ The system consists of the following components:
 
 1. **Log Image Lambda**: Validates image file types and logs to DynamoDB
 2. **Add Metadata Lambda**: Updates image metadata in DynamoDB
-3. **Update Status Lambda**: Updates review status and triggers notifications
+3. **Update Status Lambda**: Updates review status in DynamoDB
 4. **Remove Image Lambda**: Removes invalid files from the S3 bucket
 5. **Confirmation Mailer Lambda**: Sends email notifications for status changes
 
