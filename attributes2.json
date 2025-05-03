@@ -1,0 +1,6 @@
+{
+  "messageType": {
+    "DataType": "String",
+    "StringValue": "StatusUpdate"
+  }
+}

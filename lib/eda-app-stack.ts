@@ -42,6 +42,7 @@ export class EDAAppStack extends cdk.Stack {
     const metadataUpdateQueue = new sqs.Queue(this, "MetadataUpdateQueue");
     const statusUpdateQueue = new sqs.Queue(this, "StatusUpdateQueue");
     const mailerQueue = new sqs.Queue(this, "MailerQueue");
+    const rejectImageQueue = new sqs.Queue(this, "RejectImageQueue");
 
     // 5. Lambda functions
     const logImageFn = new lambdanode.NodejsFunction(this, "LogImageFn", {
@@ -78,6 +79,9 @@ export class EDAAppStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_22_X,
       entry: `${__dirname}/../lambdas/removeImage.ts`,
       handler: "handler",
+      environment: {
+        IMAGES_TABLE: imagesTable.tableName
+      },
       timeout: cdk.Duration.seconds(15),
     });
 
@@ -87,7 +91,7 @@ export class EDAAppStack extends cdk.Stack {
       handler: "handler",
       environment: {
         IMAGES_TABLE: imagesTable.tableName,
-        SES_EMAIL_FROM: "no-reply@yourdomain.com", // <- 设置你的发件地址
+        SES_EMAIL_FROM: "20108800@mail.wit.ie", 
         SES_REGION: this.region,
       },
       timeout: cdk.Duration.seconds(15),
@@ -133,6 +137,21 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
+    //  7.5 将拒绝的图片消息发送到删除队列
+    const rejectFilter = {
+      messageType: sns.SubscriptionFilter.stringFilter({
+        allowlist: ["StatusUpdate"],
+      }),
+      update: sns.SubscriptionFilter.stringFilter({
+        matchPrefixes: [JSON.stringify({ status: "Reject" })],
+      }),
+    };
+    newImageTopic.addSubscription(
+      new subs.SqsSubscription(rejectImageQueue, { 
+        filterPolicy: rejectFilter
+      })
+    );
+
     // 8. SQS -> Lambda Event Sources
     logImageFn.addEventSource(
       new events.SqsEventSource(imageProcessQueue, { batchSize: 5 })
@@ -151,17 +170,19 @@ export class EDAAppStack extends cdk.Stack {
     );
     
     removeImageFn.addEventSource(
-      new events.SqsEventSource(imagesDLQ, { batchSize: 5 })
+      new events.SqsEventSource(rejectImageQueue, { batchSize: 5 })
     );
 
     // 9. Permissions
     imagesBucket.grantRead(logImageFn);
     imagesBucket.grantDelete(removeImageFn);
+    imagesBucket.grantRead(removeImageFn);
 
     imagesTable.grantWriteData(logImageFn);
     imagesTable.grantReadWriteData(addMetadataFn);
     imagesTable.grantReadWriteData(updateStatusFn);
     imagesTable.grantReadData(confirmationMailerFn);
+    imagesTable.grantReadData(removeImageFn);
 
     // SES permissions
     confirmationMailerFn.addToRolePolicy(
